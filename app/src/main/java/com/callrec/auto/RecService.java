@@ -48,12 +48,18 @@ public class RecService extends AccessibilityService {
             "остановить запись", "прекратить запись", "завершить запись", "идет запись",
             "stop recording", "stop call recording", "recording in progress"};
 
-    private static final long MAX_WAIT_MS = 90_000;
+    /** Сколько ждать кнопку после соединения. */
+    private static final long MAX_WAIT_MS = 120_000;
+    /** Если таймер разговора нигде не найден — через сколько считать, что соединение есть. */
+    private static final long NO_TIMER_FALLBACK_MS = 60_000;
+    private static final java.util.regex.Pattern TIMER =
+            java.util.regex.Pattern.compile("^(?:(\\d{1,2}):)?(\\d{1,2}):(\\d{2})$");
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private int prevState = -1;
     private boolean callActive, done, dumped, pkgsLogged, noWinLogged, phoneRegistered;
-    private long offhookAt, lastAttemptAt, lastMoreAt, nextDelay = 900;
+    private long offhookAt, connectedAt, lastAttemptAt, lastMoreAt, nextDelay = 900;
+    private boolean waitLogged, inactiveLogged;
     private final Set<String> evPkgs = new HashSet<>();
     private BroadcastReceiver receiver;
     private Object telCb;
@@ -62,7 +68,7 @@ public class RecService extends AccessibilityService {
         @Override public void run() {
             if (!callActive || done) return;
             if (!Prefs.auto(RecService.this)) return;
-            if (SystemClock.uptimeMillis() - offhookAt > MAX_WAIT_MS + Prefs.delay(RecService.this) * 1000L) {
+            if (connectedAt > 0 && SystemClock.uptimeMillis() - connectedAt > MAX_WAIT_MS + Prefs.delay(RecService.this) * 1000L) {
                 done = true;
                 AppLog.log(RecService.this, "Не нашёл кнопку «Записать» за " + (MAX_WAIT_MS / 1000)
                         + " с. Пришлите лог и дамп экрана (кнопки в приложении).");
@@ -125,7 +131,7 @@ public class RecService extends AccessibilityService {
         }
         if (done || !allowed(pkg)) return;
         long now = SystemClock.uptimeMillis();
-        if (now - offhookAt >= Prefs.delay(this) * 1000L && now - lastAttemptAt > 500) {
+        if (now - lastAttemptAt > 500) {
             h.removeCallbacks(tick);
             h.postDelayed(tick, 250);
         }
@@ -208,6 +214,9 @@ public class RecService extends AccessibilityService {
             noWinLogged = false;
             lastMoreAt = 0;
             nextDelay = 900;
+            connectedAt = 0;
+            waitLogged = false;
+            inactiveLogged = false;
             offhookAt = SystemClock.uptimeMillis();
             evPkgs.clear();
             if (!Prefs.auto(this)) {
@@ -215,7 +224,7 @@ public class RecService extends AccessibilityService {
                 return;
             }
             h.removeCallbacks(tick);
-            h.postDelayed(tick, Prefs.delay(this) * 1000L);
+            h.postDelayed(tick, 1000);
         } else if (st == 0) {
             callActive = false;
             h.removeCallbacksAndMessages(null);
@@ -246,6 +255,26 @@ public class RecService extends AccessibilityService {
             dump(roots, "первый осмотр экрана звонка");
         }
 
+        // 0) ждём, пока собеседник ответит: пока идут гудки, кнопка записи неактивна
+        long nowMs = SystemClock.uptimeMillis();
+        if (connectedAt == 0) {
+            if (timerRunning()) {
+                connectedAt = nowMs;
+                AppLog.log(this, "Собеседник ответил (идёт таймер разговора).");
+            } else if (nowMs - offhookAt > NO_TIMER_FALLBACK_MS) {
+                connectedAt = nowMs;
+                AppLog.log(this, "Таймер разговора не найден за " + (NO_TIMER_FALLBACK_MS / 1000)
+                        + " с — продолжаю без него.");
+            } else {
+                if (!waitLogged) {
+                    waitLogged = true;
+                    AppLog.log(this, "Жду ответа собеседника (гудки/набор)…");
+                }
+                return;
+            }
+        }
+        if (nowMs - connectedAt < Prefs.delay(this) * 1000L) return;
+
         // 1) запись уже идёт?
         for (AccessibilityNodeInfo r : roots) {
             if (findStop(r, 0, new int[]{0}) != null) {
@@ -261,7 +290,15 @@ public class RecService extends AccessibilityService {
             rec = find(r, REC, 0, new int[]{0});
             if (rec != null) break;
         }
+        if (rec != null && !isActive(rec)) {
+            if (!inactiveLogged) {
+                inactiveLogged = true;
+                AppLog.log(this, "Кнопка «" + label(rec) + "» неактивна — жду.");
+            }
+            return;
+        }
         if (rec != null) {
+            inactiveLogged = false;
             boolean ok = click(rec);
             AppLog.log(this, "Нажал «" + label(rec) + "»: " + (ok ? "успешно" : "НЕ удалось"));
             if (ok) {
@@ -388,6 +425,52 @@ public class RecService extends AccessibilityService {
         CharSequence t = n.getText();
         if (t == null || t.length() == 0) t = n.getContentDescription();
         return t == null ? "?" : t.toString();
+    }
+
+    // ---------------------------------------------------------------- соединение и активность
+
+    /** Идёт ли таймер разговора (текст вида 00:01) в окне звонилки или в системной плашке звонка. */
+    private boolean timerRunning() {
+        try {
+            List<AccessibilityWindowInfo> ws = getWindows();
+            if (ws == null) return false;
+            for (AccessibilityWindowInfo w : ws) {
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r == null) continue;
+                String p = String.valueOf(r.getPackageName());
+                if (!(allowed(p) || p.contains("systemui"))) continue;
+                if (timerIn(r, 0, new int[]{0})) return true;
+            }
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private boolean timerIn(AccessibilityNodeInfo n, int depth, int[] cnt) {
+        if (n == null || depth > 40 || cnt[0]++ > 1500) return false;
+        if (isTimer(n.getText()) || isTimer(n.getContentDescription())) return true;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            if (timerIn(n.getChild(i), depth + 1, cnt)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isTimer(CharSequence cs) {
+        if (cs == null) return false;
+        java.util.regex.Matcher m = TIMER.matcher(cs.toString().trim());
+        if (!m.matches()) return false;
+        long h = m.group(1) == null ? 0 : Long.parseLong(m.group(1));
+        long total = h * 3600 + Long.parseLong(m.group(2)) * 60 + Long.parseLong(m.group(3));
+        return total >= 1;
+    }
+
+    /** Кнопка (или её кликабельный родитель) включена. */
+    private static boolean isActive(AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo n = node;
+        for (int i = 0; i < 7 && n != null; i++) {
+            if (n.isClickable()) return n.isEnabled();
+            n = n.getParent();
+        }
+        return node.isEnabled();
     }
 
     // ---------------------------------------------------------------- клики
