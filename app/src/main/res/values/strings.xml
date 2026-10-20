@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Автозапись</string>
+    <string name="tile_label">Автозапись</string>
+    <string name="service_desc">Во время звонка нажимает кнопку «Записать» в экране звонка, чтобы запись включалась автоматически. Служба не читает ваши сообщения и не передаёт данные по сети.</string>
+</resources>
